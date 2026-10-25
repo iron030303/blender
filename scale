@@ -1,0 +1,181 @@
+# -*- coding: utf-8 -*-
+"""
+scale_objects.py
+================
+对选中的 object 进行缩放，兼容 Blender 3.0 - 5.2。
+
+- 默认三个轴同时(等比)缩放；
+- 也可以只缩放一个或两个轴(其余轴保持不变)；
+- 可选围绕"各自物体自身原点"缩放(默认，互不影响)，
+  或围绕一个"公共缩放中心"(如场景原点/3D游标)整体缩放；
+- scale=0 的轴会被忽略(按 1 处理)，避免把物体压成零尺寸。
+
+用法(Blender 的 Scripting / Text 编辑器运行)
+---------------------------------------------
+    from scale_objects import scale_objects
+    scale_objects(2.0)                        # 三轴等比放大 2 倍
+    scale_objects((2.0, 1.0, 0.5))            # X 放大 2 倍、Z 缩小一半、Y 不变
+    scale_objects(scale=(1, 2), axis="XY")    # 只缩放 XY 两轴
+    scale_objects(scale=0.5, axis="Z")        # 只缩放 Z 轴
+    scale_objects(scale=2, center="CURSOR")   # 以 3D 游标为中心整体缩放
+"""
+
+import bpy
+from mathutils import Vector
+
+
+# ---------------------------------------------------------------------------
+# 参数解析
+# ---------------------------------------------------------------------------
+def _parse_scale(scale, axis):
+    """把 scale 参数归一化为 (sx, sy, sz)。只有 axis 指定的轴会被缩放。
+
+    - scale 为数值 -> axis 指定的轴缩放该倍数，其余轴保持 1；
+    - scale 为长度 1~3 的序列 -> 按 axis 给出的轴逐轴取值。
+    """
+    axes = _parse_axis(axis)
+    if isinstance(scale, (int, float)):
+        v = float(scale)
+        s = [1.0, 1.0, 1.0]
+        for ax in axes:
+            s[ax] = v
+        return _sanitize(tuple(s))
+
+    vals = [float(v) for v in scale]
+    if not vals:
+        raise ValueError("scale 不能为空")
+    if len(vals) > 3:
+        raise ValueError("scale 最多 3 个值，收到 %d 个" % len(vals))
+    if len(vals) > len(axes):
+        raise ValueError(
+            "给了 %d 个 scale 值，但 axis=%r 只有 %d 个轴"
+            % (len(vals), axis, len(axes)))
+    s = [1.0, 1.0, 1.0]
+    for ax, v in zip(axes, vals):
+        s[ax] = v
+    return _sanitize(tuple(s))
+
+
+def _sanitize(s):
+    """0 视为无效(会把物体压扁成零尺寸)，按 1 处理。"""
+    return tuple(1.0 if abs(v) < 1e-12 else v for v in s)
+
+
+def _parse_axis(axis):
+    """'X'/'XY'/'XYZ'/'xyz'/(0,2) -> 轴索引元组，如 (0, 2)。"""
+    if axis is None:
+        return (0, 1, 2)
+    if isinstance(axis, str):
+        ax = axis.upper().replace(" ", "")
+        if ax == "" or ax == "ALL":
+            return (0, 1, 2)
+        idx = []
+        for ch in ax:
+            if ch not in "XYZ":
+                raise ValueError("axis 只能包含 X/Y/Z，收到 %r" % ch)
+            i = "XYZ".index(ch)
+            if i not in idx:
+                idx.append(i)
+        return tuple(idx)
+    # 序列形式：0/1/2
+    idx = []
+    for v in axis:
+        i = int(v)
+        if i not in (0, 1, 2):
+            raise ValueError("轴索引只能是 0/1/2，收到 %r" % (v,))
+        if i not in idx:
+            idx.append(i)
+    return tuple(idx)
+
+
+def _center_point(center):
+    """解析缩放中心：None=各自原点；'WORLD'/'ORIGIN'=(0,0,0)；
+    'CURSOR'=3D 游标；否则视为坐标序列。"""
+    if center is None:
+        return None
+    if isinstance(center, str):
+        c = center.upper()
+        if c in ("WORLD", "ORIGIN", "ORIGIN_CENTER"):
+            return Vector((0.0, 0.0, 0.0))
+        if c == "CURSOR":
+            return Vector(bpy.context.scene.cursor.location)
+        raise ValueError("center 只支持 None/'WORLD'/'CURSOR'，收到 %r" % center)
+    return Vector(center)
+
+
+# ---------------------------------------------------------------------------
+# 主函数
+# ---------------------------------------------------------------------------
+def scale_objects(scale=2.0,
+                  axis=None,
+                  center=None,
+                  objects=None,
+                  use_location=True,
+                  report=True):
+    """对选中物体(或 objects 指定的物体)进行缩放。
+
+    参数
+    ----
+    scale        : 数值 -> 等比；或 1~3 个数值的序列 -> 与 axis 对应逐轴缩放。
+                   注意 scale 里为 0 的值按 1 处理(避免压成零尺寸)。
+    axis         : 缩放轴。None=XYZ 全部；字符串如 "X" / "XY" / "Z"；
+                   或轴索引序列如 (0, 2)。与多值 scale 配合使用。
+    center       : 缩放中心。
+                   None  -> 各物体绕自身原点(origin)缩放(默认)：
+                            只改物体自身尺寸，位置保持不动、互不影响；
+                   'WORLD' -> 以世界原点为中心；
+                   'CURSOR' -> 以 3D 游标为中心；
+                   也可以直接给坐标 (x, y, z)。
+    objects      : 要缩放的物体列表；None 则使用当前选中的物体。
+    use_location : 是否随缩放中心调整物体位置(仅当 center 不为 None 时
+                   才有意义；默认 True)。center=None 时位置永远不动。
+    report       : 是否打印结果。
+
+    返回
+    ----
+    被缩放的物体列表。
+    """
+    sx, sy, sz = _parse_scale(scale, axis)
+    center_pt = _center_point(center)
+
+    if objects is None:
+        objects = list(bpy.context.selected_objects)
+    objects = [o for o in objects if o and o.name]
+    if not objects:
+        if report:
+            print("scale_objects: 没有可缩放的物体。")
+        return []
+
+    sc = (sx, sy, sz)
+    for obj in objects:
+        # 1) 物体自身尺寸：按各轴相乘(局部空间，与旋转无关)
+        d = obj.scale
+        obj.scale = (d.x * sc[0], d.y * sc[1], d.z * sc[2])
+
+        # 2) 位置：仅在指定了缩放中心时，绕该中心缩放"位置偏移"。
+        #    默认(center=None)各物体绕自身 origin 缩放，位置保持不动，
+        #    不以世界原点为中心挪动物体。
+        if use_location and center_pt is not None:
+            off = Vector(obj.location) - center_pt
+            new_off = Vector((off.x * sc[0], off.y * sc[1], off.z * sc[2]))
+            obj.location = center_pt + new_off
+
+    if report:
+        ax_name = "".join("XYZ"[i] for i in _parse_axis(axis)) or "XYZ"
+        c_desc = "自身原点" if center_pt is None else (
+            "3D游标" if center == "CURSOR" else str(tuple(round(v, 3) for v in center_pt)))
+        print("scale_objects: 已缩放 %d 个物体，轴=%s，系数=%s，中心=%s"
+              % (len(objects), ax_name, sc, c_desc))
+    return objects
+
+
+# ===========================================================================
+# 示例(取消注释运行)
+# ===========================================================================
+scale_objects(2.0)                        # 三轴等比放大 2 倍
+# scale_objects(0.5)                        # 三轴等比缩小一半
+# scale_objects((1, 2, 3))                  # X*1, Y*2, Z*3
+# scale_objects(2.0, axis="X")              # 只放大 X 轴
+# scale_objects((2, 0.5), axis="XY")        # X*2, Y*0.5, Z 不变
+# scale_objects(2, center="CURSOR")         # 以 3D 游标为中心整体缩放
+# scale_objects(2, center=(1, 2, 3))        # 以指定点为中心整体缩放
